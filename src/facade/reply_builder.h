@@ -5,14 +5,21 @@
 
 #include <absl/container/flat_hash_map.h>
 
+#include <memory>
 #include <optional>
+#include <string>
 #include <string_view>
+#include <vector>
 
+#include "base/logging.h"
+#include "base/ring_buffer.h"
 #include "facade/facade_types.h"
 #include "facade/op_status.h"
 #include "io/io.h"
 
 namespace facade {
+
+class ConnectionContext;
 
 // Reply mode allows filtering replies.
 enum class ReplyMode {
@@ -169,10 +176,13 @@ class MCReplyBuilder : public SinkReplyBuilder {
 class RedisReplyBuilder : public SinkReplyBuilder {
  public:
   enum CollectionType { ARRAY, SET, MAP, PUSH };
+  static constexpr unsigned buffer_capacity = 4u;
 
   using StrSpan = std::variant<absl::Span<const std::string>, absl::Span<const std::string_view>>;
 
-  RedisReplyBuilder(::io::Sink* stream);
+  //! capacity must be a power of 2, see RingBuffer
+  RedisReplyBuilder(::io::Sink* stream, facade::ConnectionContext* cntx,
+                    unsigned capacity = buffer_capacity);
 
   void SetResp3(bool is_resp3);
 
@@ -210,6 +220,16 @@ class RedisReplyBuilder : public SinkReplyBuilder {
   // into the string that would be sent
   static std::string_view StatusToMsg(OpStatus status);
 
+  std::vector<std::string> GetSavedErrors(void);
+  void FlushErrors(void) {
+    const unsigned int capacity = buffer_->capacity();
+    buffer_.reset(new base::RingBuffer<std::string>(capacity));
+  }
+
+  void ResizeErrorsBuffer(unsigned int new_capacity) {
+    buffer_.reset(new base::RingBuffer<std::string>(new_capacity));
+  }
+
  protected:
   struct WrappedStrSpan : public StrSpan {
     size_t Size() const;
@@ -222,6 +242,9 @@ class RedisReplyBuilder : public SinkReplyBuilder {
   const char* NullString();
 
   bool is_resp3_ = false;
+  std::unique_ptr<base::RingBuffer<std::string>> buffer_;  // DEBUG ERRORS logs error here
+  unsigned buffer_start_;
+  facade::ConnectionContext* cntx_;
 };
 
 class ReqSerializer {

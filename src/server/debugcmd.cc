@@ -5,6 +5,7 @@
 
 #include <absl/cleanup/cleanup.h>
 #include <absl/random/random.h>
+#include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
 
 #include <filesystem>
@@ -210,6 +211,30 @@ void DoBuildObjHist(EngineShard* shard, ObjHistMap* obj_hist_map) {
   }
 }
 
+void ErrorStatsInternal(ConnectionContext* cntx, CmdArgList args) {
+  auto* rb =
+      cntx->operator->();  // returns RedisReplyBuilder, safety checks performed inside operator->()
+
+  if (args.size() > 1) {  // received arguments
+    auto arg = ArgS(args, 1);
+    if (absl::EqualsIgnoreCase(arg, "FLUSH")) {
+      rb->FlushErrors();
+    } else if (absl::EqualsIgnoreCase(arg, "RESIZE")) {
+      unsigned int out{0};
+      if (!absl::SimpleAtoi(ArgS(args, 2), &out)) {
+        return rb->SendError(kInvalidIntErr);
+      }
+      rb->ResizeErrorsBuffer(out);
+    } else {
+      rb->SendError(kSyntaxErrType);
+    }
+  } else {
+    return rb->SendStringArr(rb->GetSavedErrors());
+  }
+
+  rb->SendOk();
+}
+
 }  // namespace
 
 DebugCmd::DebugCmd(ServerFamily* owner, ConnectionContext* cntx) : sf_(*owner), cntx_(cntx) {
@@ -244,6 +269,11 @@ void DebugCmd::Run(CmdArgList args) {
         "    If SLOTS is specified then create keys only in given slots range."
         "OBJHIST",
         "    Prints histogram of object sizes.",
+        "ERRORS [FLUSH] [RESIZE <new_size>]",
+        "    Returns the last K errors recorded in Dragonfly. By default, k = 32.",
+        "    It is possible to clear the buffer by using [FLUSH].",
+        "    Resize the buffer using [RESIZE <size>]. This will clear the buffer. The new size "
+        "must be a power of 2.",
         "HELP",
         "    Prints this help.",
     };
@@ -283,6 +313,11 @@ void DebugCmd::Run(CmdArgList args) {
   if (subcmd == "OBJHIST") {
     return ObjHist();
   }
+
+  if (subcmd == "ERRORS") {
+    return ErrorStatsInternal(cntx_, args);
+  }
+
   string reply = UnknownSubCmd(subcmd, "DEBUG");
   return (*cntx_)->SendError(reply, kSyntaxErrType);
 }

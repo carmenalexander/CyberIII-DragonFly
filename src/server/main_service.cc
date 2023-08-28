@@ -252,7 +252,8 @@ void DispatchMonitor(ConnectionContext* cntx, const CommandId* cid, CmdArgList t
 
 class InterpreterReplier : public RedisReplyBuilder {
  public:
-  InterpreterReplier(ObjectExplorer* explr) : RedisReplyBuilder(nullptr), explr_(explr) {
+  InterpreterReplier(ObjectExplorer* explr)
+      : RedisReplyBuilder(nullptr, nullptr, 0u), explr_(explr) {
   }
 
   void SendError(std::string_view str, std::string_view type = std::string_view{}) final;

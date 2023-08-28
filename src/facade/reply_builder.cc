@@ -4,12 +4,17 @@
 #include "facade/reply_builder.h"
 
 #include <absl/container/fixed_array.h>
+#include <absl/strings/match.h>
 #include <absl/strings/numbers.h>
 #include <absl/strings/str_cat.h>
+#include <absl/strings/str_join.h>
 #include <double-conversion/double-to-string.h>
 
 #include "base/logging.h"
 #include "facade/error.h"
+#include "src/facade/conn_context.h"
+#include "src/facade/dragonfly_connection.h"
+#include "src/server/conn_context.h"
 
 using namespace std;
 using absl::StrAppend;
@@ -196,7 +201,10 @@ char* RedisReplyBuilder::FormatDouble(double val, char* dest, unsigned dest_len)
   return sb.Finalize();
 }
 
-RedisReplyBuilder::RedisReplyBuilder(::io::Sink* sink) : SinkReplyBuilder(sink) {
+RedisReplyBuilder::RedisReplyBuilder(::io::Sink* sink, facade::ConnectionContext* cntx,
+                                     unsigned capacity)
+    : SinkReplyBuilder(sink),
+      buffer_(new base::RingBuffer<string>(capacity)), buffer_start_{0}, cntx_{cntx} {
 }
 
 void RedisReplyBuilder::SetResp3(bool is_resp3) {
@@ -204,7 +212,7 @@ void RedisReplyBuilder::SetResp3(bool is_resp3) {
 }
 
 void RedisReplyBuilder::SendError(string_view str, string_view err_type) {
-  VLOG(1) << "Error: " << str;
+  VLOG(1) << "Error: " << str << " of type: " << (err_type.empty() ? "(no type)"sv : err_type);
 
   if (err_type.empty()) {
     err_type = str;
@@ -214,12 +222,51 @@ void RedisReplyBuilder::SendError(string_view str, string_view err_type) {
 
   err_count_[err_type]++;
 
-  if (str[0] == '-') {
-    iovec v[] = {IoVec(str), IoVec(kCRLF)};
-    Send(v, ABSL_ARRAYSIZE(v));
-  } else {
-    iovec v[] = {IoVec(kErrPref), IoVec(str), IoVec(kCRLF)};
-    Send(v, ABSL_ARRAYSIZE(v));
+  vector<iovec> v(3u);
+
+  if (str[0] != '-')
+    v.push_back(IoVec(kErrPref));
+
+  v.insert(v.end(), {IoVec(str), IoVec(kCRLF)});
+  v.shrink_to_fit();
+  Send(v.data(), v.size());
+
+  if (buffer_->capacity() > 0u && cntx_ != nullptr) {
+    string s;
+
+    if (absl::StartsWith(str, "unknown command"))
+      s = str;
+    else {
+      auto* dfly_cntx = static_cast<dfly::ConnectionContext*>(cntx_);
+      string prefix;
+
+      if (dfly_cntx && dfly_cntx->cid) {
+        prefix.reserve(128u);
+
+        auto args = dfly_cntx->owner()->GetParsedArguments();
+
+        // limit the length of the prefix to be 128 chars
+        for (auto i = 0u; i < args.length(); ++i) {
+          auto next = ArgS(args, i);
+
+          if ((prefix.length() + next.length()) <= 128u) {
+            prefix.append(next);
+            prefix.append(" ", 1u);
+          } else {
+            prefix.append("...");
+            break;
+          }
+        }
+
+        s = absl::StrCat(prefix, ": ", str);
+      } else {
+        prefix = "<no cid>";
+      }
+
+      s = absl::StrCat(prefix, ": ", str);
+    }
+
+    buffer_start_ += buffer_->EmplaceOrOverride(move(s));
   }
 }
 
@@ -501,6 +548,40 @@ void RedisReplyBuilder::SendStringArrInternal(WrappedStrSpan arr, CollectionType
   vec[vec_indx].iov_base = start;
   vec[vec_indx].iov_len = 2;
   Send(vec.data(), vec_indx + 1);
+}
+
+vector<string> RedisReplyBuilder::GetSavedErrors(void) {
+  /**
+   * Items are inserted to the RingBuffer by its tail, yet GetItem()
+   * returns items starting from the head. This implies that printing
+   * GetItem(0u) would print errors from oldest to newest.
+   * It is not possible to lazily reverse this result, i.e.,
+   * by using GetItem(size() - 1) as the head, since
+   * GetItem(size()) != GetItem(size() - 1)[1], which in words means
+   * that the next item in GetItem(size() - 1) is not what we want.
+   *
+   * Since this is not a hot path, an explicit copy and reversal will suffice.
+   */
+
+  const auto sz = buffer_->size();
+  vector<string> reversed(sz);
+
+  /**
+   * What is going on here:
+   * In `buffer_start_` we store the index at which the buffer
+   * logically starts, w.r.t time. This means that GetItem(buffer_start_)
+   * is the oldest item in the buffer.
+   *
+   * With this in mind, we want to read the buffer, starting
+   * from buffer_start_, and ending at its size, and reverse it
+   *
+   * Logically this means calling GetItem(buffer_start_), GetItem(buffer_start_ + 1)
+   * till GetItem(buffer_start_ + sz - 1), and to save time we reverse the array immediately
+   */
+  for (auto i = 0u; i < sz; ++i)
+    reversed.push_back(*buffer_->GetItem(buffer_start_ + sz - 1 - i));
+
+  return reversed;
 }
 
 void ReqSerializer::SendCommand(std::string_view str) {

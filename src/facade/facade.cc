@@ -116,7 +116,7 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, Connection* owner) : ow
   if (stream) {
     switch (protocol_) {
       case Protocol::REDIS:
-        rbuilder_.reset(new RedisReplyBuilder(stream));
+        rbuilder_.reset(new RedisReplyBuilder(stream, this));
         break;
       case Protocol::MEMCACHE:
         rbuilder_.reset(new MCReplyBuilder(stream));
