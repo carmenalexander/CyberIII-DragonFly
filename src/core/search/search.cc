@@ -599,4 +599,8 @@ void SearchAlgorithm::EnableProfiling() {
   profiling_enabled_ = true;
 }
 
+bool SearchAlgorithm::IsProfilingEnabled() const {
+  return profiling_enabled_;
+}
+
 }  // namespace dfly::search

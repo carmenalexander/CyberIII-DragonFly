@@ -320,6 +320,11 @@ class Transaction {
                          bool multi_commands, bool allow_await) const;
   void FinishLogJournalOnShard(EngineShard* shard, uint32_t shard_cnt) const;
 
+  void Refurbish();
+
+  void EnableShard(ShardId sid);
+  void EnableAllShards();
+
  private:
   // Holds number of locks for each IntentLock::Mode: shared and exlusive.
   struct LockCnt {
@@ -412,9 +417,6 @@ class Transaction {
 
   // Init with a set of keys.
   void InitByKeys(KeyIndex keys);
-
-  void EnableShard(ShardId sid);
-  void EnableAllShards();
 
   // Build shard index by distributing the arguments by shards based on the key index.
   void BuildShardIndex(KeyIndex keys, bool rev_mapping, std::vector<PerShardCache>* out);
