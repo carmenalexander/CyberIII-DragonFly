@@ -415,6 +415,7 @@ struct BasicSearch {
         profile_builder_ ? make_optional(profile_builder_->Take()) : nullopt;
 
     size_t total = result.Size();
+
     return SearchResult{total,
                         max(total, preagg_total_),
                         result.Take(limit_),
@@ -423,6 +424,7 @@ struct BasicSearch {
                         std::move(error_)};
   }
 
+ private:
   const FieldIndices* indices_;
   size_t limit_;
 

@@ -246,7 +246,7 @@ struct MultishardSearch {
         return Reply();
     }
 
-    VLOG(0) << "Failed completness check, refilling";
+    VLOG(1) << "Failed completness check, refilling";
 
     // Otherwise, some results made it into the result set but were not serialized.
     // Try refilling the requested values. If no reordering occured, reply immediately, otherwise
@@ -265,7 +265,7 @@ struct MultishardSearch {
         return Reply();
     }
 
-    VLOG(0) << "Failed refill and rebuild, re-searching";
+    VLOG(1) << "Failed refill and rebuild, re-searching";
 
     // At this step all optimizations failed. Run search without any cutoffs.
     {
@@ -413,10 +413,6 @@ struct MultishardSearch {
   void BuildLinearOrder() {
     size_t required = params_.limit_offset + params_.limit_total;
 
-    VLOG(0) << "Linear order";
-    for (auto& shard_result : sharded_results_)
-      VLOG(0) << "|->source " << shard_result.docs.size();
-
     for (size_t idx = 0;; idx++) {
       bool added = false;
       for (auto& shard_result : sharded_results_) {
@@ -449,7 +445,6 @@ struct MultishardSearch {
   }
 
   absl::flat_hash_set<ShardId> VerifyOrderCompletness() {
-    VLOG(0) << "Verifying order completness of " << ordered_docs_.size();
     absl::flat_hash_set<ShardId> incomplete_shards;
     for (auto* doc : ordered_docs_) {
       if (auto* ref = get_if<DocResult::DocReference>(&doc->value); ref) {
@@ -457,7 +452,6 @@ struct MultishardSearch {
         ref->requested = true;
       }
     }
-    VLOG(0) << "Num incomplete shards " << incomplete_shards.size();
     return incomplete_shards;
   }
 
