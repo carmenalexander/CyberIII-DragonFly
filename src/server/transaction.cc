@@ -321,7 +321,7 @@ OpStatus Transaction::InitByArgs(DbIndex index, CmdArgList args) {
     if ((cid_->opt_mask() & CO::NO_KEY_TX_SPAN_ALL) > 0)
       EnableAllShards();
     else
-      EnableShard(0);
+      EnableSingleShard(0);
     return OpStatus::OK;
   }
 
@@ -426,7 +426,7 @@ string Transaction::DebugId() const {
 void Transaction::PrepareMultiForScheduleSingleHop(ShardId sid, DbIndex db, CmdArgList args) {
   multi_.reset();
   InitBase(db, args);
-  EnableShard(sid);
+  EnableSingleShard(sid);
   OpResult<KeyIndex> key_index = DetermineKeys(cid_, args);
   CHECK(key_index);
   StoreKeysInArgs(*key_index, false);
@@ -913,7 +913,7 @@ void Transaction::Refurbish() {
   cb_ptr_ = nullptr;
 }
 
-void Transaction::EnableShard(ShardId sid) {
+void Transaction::EnableSingleShard(ShardId sid) {
   unique_shard_cnt_ = 1;
   unique_shard_id_ = sid;
   shard_data_.resize(1);

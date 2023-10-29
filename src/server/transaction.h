@@ -320,9 +320,11 @@ class Transaction {
                          bool multi_commands, bool allow_await) const;
   void FinishLogJournalOnShard(EngineShard* shard, uint32_t shard_cnt) const;
 
+  // Reset all execution related data to make it possible for the transaction to be scheduled and
+  // executed again.
   void Refurbish();
 
-  void EnableShard(ShardId sid);
+  void EnableSingleShard(ShardId sid);
   void EnableAllShards();
 
  private:

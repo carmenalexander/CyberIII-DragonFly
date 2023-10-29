@@ -233,39 +233,51 @@ struct MultishardSearch {
   }
 
   void RunAndReply() {
-    params_.enable_cutoff = true;
-    params_.num_shards = shard_set->size();
+    // First, run search with probabilistic optimizations enabled.
+    // If the result set was collected successfuly, reply.
+    {
+      params_.enable_cutoff = true;
 
-    if (auto err = RunSearch(); err)
-      return (*cntx_)->SendError(std::move(*err));
+      if (auto err = RunSearch(); err)
+        return (*cntx_)->SendError(std::move(*err));
 
-    auto incomplete_shards = BuildOrder();
-    if (incomplete_shards.empty())
-      return Reply();
-
-    params_.enable_cutoff = false;
+      auto incomplete_shards = BuildOrder();
+      if (incomplete_shards.empty())
+        return Reply();
+    }
 
     VLOG(0) << "Failed completness check, refilling";
 
-    auto refill_res = RunRefill();
-    if (!refill_res.has_value())
-      return (*cntx_)->SendError(std::move(refill_res.error()));
+    // Otherwise, some results made it into the result set but were not serialized.
+    // Try refilling the requested values. If no reordering occured, reply immediately, otherwise
+    // try building a new order and reply if it is valid.
+    {
+      params_.enable_cutoff = false;
 
-    if (bool no_reordering = refill_res.value(); no_reordering)
-      return Reply();
+      auto refill_res = RunRefill();
+      if (!refill_res.has_value())
+        return (*cntx_)->SendError(std::move(refill_res.error()));
 
-    VLOG(0) << "Failed refill, rebuilding";
+      if (bool no_reordering = refill_res.value(); no_reordering)
+        return Reply();
 
-    if (auto incomplete_shards = BuildOrder(); incomplete_shards.empty())
-      return Reply();
+      if (auto incomplete_shards = BuildOrder(); incomplete_shards.empty())
+        return Reply();
+    }
 
-    VLOG(0) << "Failed rebuild, re-searching";
+    VLOG(0) << "Failed refill and rebuild, re-searching";
 
-    if (auto err = RunSearch(); err)
-      return (*cntx_)->SendError(std::move(*err));
-    incomplete_shards = BuildOrder();
-    DCHECK(incomplete_shards.empty());
-    Reply();
+    // At this step all optimizations failed. Run search without any cutoffs.
+    {
+      DCHECK(!params_.enable_cutoff);
+
+      if (auto err = RunSearch(); err)
+        return (*cntx_)->SendError(std::move(*err));
+
+      auto incomplete_shards = BuildOrder();
+      DCHECK(incomplete_shards.empty());
+      Reply();
+    }
   }
 
   struct ProfileInfo {
@@ -318,8 +330,6 @@ struct MultishardSearch {
     bool ids_only = params_.IdsOnly();
     size_t reply_size = ids_only ? (result_count + 1) : (result_count * 2 + 1);
 
-    VLOG(0) << "Reply size " << reply_size << " total count " << total_count;
-
     (*cntx_)->StartArray(reply_size);
     (*cntx_)->SendLong(total_count);
 
@@ -337,7 +347,9 @@ struct MultishardSearch {
     }
   }
 
-  template <typename F> optional<facade::ErrorReply> RunHandler(F&& f) {
+  // Run function f on all search indices, return first error
+  std::optional<facade::ErrorReply> RunHandler(
+      std::function<std::optional<ErrorReply>(EngineShard*, ShardDocIndex*)> f) {
     hops_++;
     AggregateValue<optional<facade::ErrorReply>> err;
     cntx_->transaction->ScheduleSingleHop([&](Transaction* t, EngineShard* es) {
@@ -387,6 +399,7 @@ struct MultishardSearch {
     return failed_refills == 0;
   }
 
+  // Build order from results collected from shards
   absl::flat_hash_set<ShardId> BuildOrder() {
     ordered_docs_.clear();
     if (auto agg = search_algo_->HasAggregation(); agg) {
