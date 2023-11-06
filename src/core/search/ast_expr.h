@@ -108,6 +108,11 @@ struct AstNode : public NodeVariants {
   const NodeVariants& Variant() const& {
     return *this;
   }
+
+  // Aggregations: KNN, SORTBY. They reorder result sets and optionally reduce them.
+  bool IsAggregation() const {
+    return std::holds_alternative<AstKnnNode>(Variant());
+  }
 };
 
 using AstExpr = AstNode;

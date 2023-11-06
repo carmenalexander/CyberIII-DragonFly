@@ -25,52 +25,61 @@ using SearchDocData = absl::flat_hash_map<std::string /*field*/, std::string /*v
 std::optional<search::SchemaField::FieldType> ParseSearchFieldType(std::string_view name);
 std::string_view SearchFieldTypeToString(search::SchemaField::FieldType);
 
-struct SerializedSearchDoc {
-  std::string key;
-  SearchDocData values;
-  search::ResultScore score;
+// Represents results returned from a shard doc index that are then aggregated in the coordinator.
+struct DocResult {
+  // Fully serialized value ready to be sent back.
+  struct SerializedValue {
+    std::string key;
+    SearchDocData values;
+  };
 
-  bool operator<(const SerializedSearchDoc& other) const;
-  bool operator>=(const SerializedSearchDoc& other) const;
+  // Reference to a document that matched the query, but it's serialization was skipped as the
+  // document was considered unlikely to be contained in the reply.
+  struct DocReference {
+    ShardId shard_id;
+    search::DocId doc_id;
+    bool requested;
+  };
+
+  bool operator<(const DocResult& other) const;
+  bool operator>=(const DocResult& other) const;
+
+ public:
+  std::variant<SerializedValue, DocReference> value;
+  search::ResultScore score;
 };
 
 struct SearchResult {
-  SearchResult() = default;
+  size_t write_epoch = 0;  // Write epoch of the index on which the result was created
 
-  SearchResult(size_t total_hits, std::vector<SerializedSearchDoc> docs,
-               std::optional<search::AlgorithmProfile> profile)
-      : total_hits{total_hits}, docs{std::move(docs)}, profile{std::move(profile)} {
-  }
+  size_t total_hits = 0;        // total number of hits in shard
+  std::vector<DocResult> docs;  // serialized documents of first hits
 
-  SearchResult(facade::ErrorReply error) : error{std::move(error)} {
-  }
-
-  size_t total_hits;
-  std::vector<SerializedSearchDoc> docs;
   std::optional<search::AlgorithmProfile> profile;
-
-  std::optional<facade::ErrorReply> error;
 };
 
 struct SearchParams {
   using FieldReturnList =
       std::vector<std::pair<std::string /*identifier*/, std::string /*short name*/>>;
 
-  // Parameters for "LIMIT offset total": select total amount documents with a specific offset from
-  // the whole result set
-  size_t limit_offset = 0;
-  size_t limit_total = 10;
-
-  // Set but empty means no fields should be returned
-  std::optional<FieldReturnList> return_fields;
-  std::optional<search::SortOption> sort_option;
-  search::QueryParams query_params;
-
   bool IdsOnly() const {
     return return_fields && return_fields->empty();
   }
 
   bool ShouldReturnField(std::string_view field) const;
+
+ public:
+  // Parameters for "LIMIT offset total": select total amount documents with a specific offset.
+  size_t limit_offset = 0;
+  size_t limit_total = 10;
+
+  // Pprobabilistic optimizations that avoid serializing documents unlikely to be returned.
+  bool enable_cutoff = false;
+
+  std::optional<FieldReturnList> return_fields;  // Set but empty means no fields should be returned
+
+  std::optional<search::SortOption> sort_option;
+  search::QueryParams query_params;
 };
 
 // Stores basic info about a document index.
@@ -123,8 +132,14 @@ class ShardDocIndex {
   ShardDocIndex(std::shared_ptr<DocIndex> index);
 
   // Perform search on all indexed documents and return results.
-  SearchResult Search(const OpArgs& op_args, const SearchParams& params,
-                      search::SearchAlgorithm* search_algo) const;
+  io::Result<SearchResult, facade::ErrorReply> Search(const OpArgs& op_args,
+                                                      const SearchParams& params,
+                                                      search::SearchAlgorithm* search_algo) const;
+
+  // Resolve requested doc references from the result. If no writes occured, the remaining
+  // entries are serialized and true is returned, otherwise a full new query is performed.
+  bool Refill(const OpArgs& op_args, const SearchParams& params,
+              search::SearchAlgorithm* search_algo, SearchResult* result) const;
 
   // Return whether base index matches
   bool Matches(std::string_view key, unsigned obj_code) const;
@@ -138,10 +153,17 @@ class ShardDocIndex {
   // Clears internal data. Traverses all matching documents and assigns ids.
   void Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr);
 
+  // Serialize prefix of requested doc references.
+  void Serialize(const OpArgs& op_args, const SearchParams& params,
+                 absl::Span<DocResult> docs) const;
+
  private:
   std::shared_ptr<const DocIndex> base_;
   search::FieldIndices indices_;
   DocKeyIndex key_index_;
+
+  // Incremented during each Add/Remove. Used to track if changes occured since last read.
+  size_t write_epoch_;
 };
 
 // Stores shard doc indices by name on a specific shard.

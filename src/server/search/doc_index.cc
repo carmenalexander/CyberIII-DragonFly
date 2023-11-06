@@ -56,13 +56,44 @@ const absl::flat_hash_map<string_view, search::SchemaField::FieldType> kSchemaTy
     {"NUMERIC"sv, search::SchemaField::NUMERIC},
     {"VECTOR"sv, search::SchemaField::VECTOR}};
 
+size_t GetProbabilisticBound(size_t hits, size_t requested, optional<search::AggregationInfo> agg) {
+  auto intlog2 = [](size_t x) {
+    size_t l = 0;
+    while (x >>= 1)
+      ++l;
+    return l;
+  };
+
+  if (hits == 0 || requested == 0)
+    return 0;
+
+  size_t shards = shard_set->size();
+
+  // Estimate how much every shard has with at least 99% prob
+  size_t avg_shard_min = hits * intlog2(hits) / (12 + shard_set->size() / 10);
+  avg_shard_min -= min(avg_shard_min, min(hits, size_t(5)));
+
+  // If it turns out that we might have not enough results to cover the request, don't skip any
+  if (avg_shard_min * shards < requested)
+    return requested;
+
+  // If all shards have at least avg min, keep the bare minimum needed to cover the request
+  size_t limit = requested / shards + 1;
+
+  // Aggregations like SORTBY and KNN reorder the result and thus introduce some variance
+  if (agg.has_value())
+    limit += max(requested / 4 + 1, 3UL);
+
+  return limit;
+}
+
 }  // namespace
 
-bool SerializedSearchDoc::operator<(const SerializedSearchDoc& other) const {
+bool DocResult::operator<(const DocResult& other) const {
   return this->score < other.score;
 }
 
-bool SerializedSearchDoc::operator>=(const SerializedSearchDoc& other) const {
+bool DocResult::operator>=(const DocResult& other) const {
   return this->score >= other.score;
 }
 
@@ -171,10 +202,11 @@ bool DocIndex::Matches(string_view key, unsigned obj_code) const {
 }
 
 ShardDocIndex::ShardDocIndex(shared_ptr<DocIndex> index)
-    : base_{std::move(index)}, indices_{{}, nullptr}, key_index_{} {
+    : base_{std::move(index)}, indices_{{}, nullptr}, key_index_{}, write_epoch_{0} {
 }
 
 void ShardDocIndex::Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr) {
+  write_epoch_++;
   key_index_ = DocKeyIndex{};
   indices_ = search::FieldIndices{base_->schema, mr};
 
@@ -185,11 +217,13 @@ void ShardDocIndex::Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr) 
 }
 
 void ShardDocIndex::AddDoc(string_view key, const DbContext& db_cntx, const PrimeValue& pv) {
+  write_epoch_++;
   auto accessor = GetAccessor(db_cntx, pv);
   indices_.Add(key_index_.Add(key), accessor.get());
 }
 
 void ShardDocIndex::RemoveDoc(string_view key, const DbContext& db_cntx, const PrimeValue& pv) {
+  write_epoch_++;
   auto accessor = GetAccessor(db_cntx, pv);
   DocId id = key_index_.Remove(key);
   indices_.Remove(id, accessor.get());
@@ -199,38 +233,83 @@ bool ShardDocIndex::Matches(string_view key, unsigned obj_code) const {
   return base_->Matches(key, obj_code);
 }
 
-SearchResult ShardDocIndex::Search(const OpArgs& op_args, const SearchParams& params,
-                                   search::SearchAlgorithm* search_algo) const {
-  auto& db_slice = op_args.shard->db_slice();
-  auto search_results = search_algo->Search(&indices_, params.limit_offset + params.limit_total);
-
+io::Result<SearchResult, facade::ErrorReply> ShardDocIndex::Search(
+    const OpArgs& op_args, const SearchParams& params, search::SearchAlgorithm* search_algo) const {
+  size_t requested_count = params.limit_offset + params.limit_total;
+  auto search_results = search_algo->Search(&indices_, requested_count);
   if (!search_results.error.empty())
-    return SearchResult{facade::ErrorReply{std::move(search_results.error)}};
+    return nonstd::make_unexpected(facade::ErrorReply(std::move(search_results.error)));
 
-  vector<SerializedSearchDoc> out;
-  out.reserve(search_results.ids.size());
+  size_t return_count = min(requested_count, search_results.ids.size());
 
-  size_t expired_count = 0;
-  for (size_t i = 0; i < search_results.ids.size(); i++) {
-    auto key = key_index_.Get(search_results.ids[i]);
+  // Probabilistic optimization: If we are about 99% sure that all shards in total fetch more
+  // results than needed to statisfy the search request, we can avoid serializing some of the last
+  // result hits as they likely won't be needed. The `cutoff_bound` indicates how much entries it's
+  // reasonable to serialize directly, for the rest only id's are stored. In the 1% case they are
+  // either serialized on another hop or the query is fully repeated without this optimization.
+  size_t cuttoff_bound = requested_count;
+  if (params.enable_cutoff && !params.IdsOnly()) {
+    cuttoff_bound = GetProbabilisticBound(search_results.pre_aggregation_total, requested_count,
+                                          search_algo->HasAggregation());
+  }
+
+  vector<DocResult> out(return_count);
+  auto shard_id = EngineShard::tlocal()->shard_id();
+  auto& scores = search_results.scores;
+  for (size_t i = 0; i < out.size(); i++) {
+    out[i].value = DocResult::DocReference{shard_id, search_results.ids[i], i < cuttoff_bound};
+    out[i].score = scores.empty() ? search::ResultScore{} : std::move(scores[i]);
+  }
+
+  Serialize(op_args, params, absl::MakeSpan(out));
+
+  return SearchResult{write_epoch_, search_results.total, std::move(out),
+                      std::move(search_results.profile)};
+}
+
+bool ShardDocIndex::Refill(const OpArgs& op_args, const SearchParams& params,
+                           search::SearchAlgorithm* search_algo, SearchResult* result) const {
+  // If no writes occured, serialize remaining entries without breaking correctness
+  if (result->write_epoch == write_epoch_) {
+    Serialize(op_args, params, absl::MakeSpan(result->docs));
+    return true;
+  }
+
+  // We're already on the cold path and we don't wanna gamble any more
+  DCHECK(!params.enable_cutoff);
+
+  auto new_result = Search(op_args, params, search_algo);
+  CHECK(new_result.has_value());  // Query should be valid since it passed first step
+
+  *result = std::move(new_result.value());
+  return false;
+}
+
+void ShardDocIndex::Serialize(const OpArgs& op_args, const SearchParams& params,
+                              absl::Span<DocResult> docs) const {
+  auto& db_slice = op_args.shard->db_slice();
+
+  for (auto& doc : docs) {
+    if (!holds_alternative<DocResult::DocReference>(doc.value))
+      continue;
+
+    auto ref = get<DocResult::DocReference>(doc.value);
+    if (!ref.requested)
+      return;
+
+    string key{key_index_.Get(ref.doc_id)};
+
     auto it = db_slice.Find(op_args.db_cntx, key, base_->GetObjCode());
-
     if (!it || !IsValid(*it)) {  // Item must have expired
-      expired_count++;
+      doc.value = DocResult::SerializedValue{std::move(key), {}};
       continue;
     }
 
     auto accessor = GetAccessor(op_args.db_cntx, (*it)->second);
     auto doc_data = params.return_fields ? accessor->Serialize(base_->schema, *params.return_fields)
                                          : accessor->Serialize(base_->schema);
-
-    auto score =
-        search_results.scores.empty() ? std::monostate{} : std::move(search_results.scores[i]);
-    out.push_back(SerializedSearchDoc{string{key}, std::move(doc_data), std::move(score)});
+    doc.value = DocResult::SerializedValue{std::move(key), std::move(doc_data)};
   }
-
-  return SearchResult{search_results.total - expired_count, std::move(out),
-                      std::move(search_results.profile)};
 }
 
 DocIndexInfo ShardDocIndex::GetInfo() const {
