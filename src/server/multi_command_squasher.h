@@ -50,6 +50,8 @@ class MultiCommandSquasher {
   // Lazy initialize shard info.
   ShardExecInfo& PrepareShardInfo(ShardId sid, std::optional<SlotId> slot_id);
 
+  void PerformHop();
+
   // Retrun squash flags
   SquashResult TrySquash(StoredCmd* cmd);
 
@@ -57,7 +59,7 @@ class MultiCommandSquasher {
   bool ExecuteStandalone(StoredCmd* cmd);
 
   // Callback that runs on shards during squashed hop.
-  facade::OpStatus SquashedHopCb(Transaction* parent_tx, EngineShard* es);
+  facade::OpStatus SquashedHopCb(const Transaction* parent_tx, EngineShard* es);
 
   // Execute all currently squashed commands. Return false if aborting on error.
   bool ExecuteSquashed();
