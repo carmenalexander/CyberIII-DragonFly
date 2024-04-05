@@ -1,9 +1,11 @@
 name: benchmark-tests
 
 on:
+  workflow_dispatch:
   schedule:
     - cron: "0 9 * * *" # run at 6 AM UTC
-  workflow_dispatch:
+
+
 
 jobs:
   benchmark:
@@ -32,30 +34,58 @@ jobs:
                   cpu: "2"
                   memory: "2000Mi"
 
-    runs-on: [self-hosted, linux, x86, benchmark]
+#    runs-on: [self-hosted, linux, x86, benchmark]
+    runs-on: ubuntu-latest
 
     container:
       image: ghcr.io/romange/benchmark-dev:latest
+      options: --cpus 2
 
     steps:
       - uses: actions/checkout@v3
         with:
           submodules: true
-      - name: install sude
+
+      - name: install sudo
         run: |
           apt-get update
           apt-get install sudo
+
+
       - name: Set up Python
         uses: actions/setup-python@v3
         with:
           python-version: 3.9
-      - name: Create k8s Kind Cluster
-        uses: helm/kind-action@v1.9.0
-        with:
-          kubectl_version: v1.28.0
-      - run: |
-          kubectl config get-contexts
-          kubectl cluster-info --context kind-chart-testing
+
+#https://github.com/helm/kind-action/issues/30
+      - name: FIX Kind on container issue
+        run: |
+          export KUBECONFIG=$HOME/.kube/config
+          export KIND_EXPERIMENTAL_DOCKER_NETWORK=${{ job.container.network }}
+          echo ${KIND_EXPERIMENTAL_DOCKER_NETWORK}
+          # Install Kind
+          [ $(uname -m) = x86_64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.22.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+          # Install Kind Cluster
+          kind create cluster \
+            --kubeconfig $KUBECONFIG \
+            --config=.github/workflows/kind-config.yaml \
+            --name action || true
+          # Install Kubectl
+          curl -LO https://dl.k8s.io/release/v1.29.2/bin/linux/amd64/kubectl
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          # Kubectl set context
+          kubectl config set-cluster kind-action --server=https://action-control-plane:6443 
+
+#      - name: Create k8s Kind Cluster
+#        uses: helm/kind-action@v1.9.0
+#        with:
+#          kubectl_version: v1.28.0
+#          cluster_name: action
+#          config: .github/workflows/kind-config.yaml
+
+
       - name: Install the CRD and Operator
         run: |
           # Install the CRD and Operator
