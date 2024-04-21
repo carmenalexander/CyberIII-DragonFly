@@ -166,6 +166,57 @@ class Transaction {
     RAN_IMMEDIATELY = 1 << 7,  // Whether the shard executed immediately (during schedule)
   };
 
+  // References arguments in another array.
+  using KVSlice = std::pair<uint32_t, uint32_t>;  // (begin, end)
+
+  struct ShardArgs {
+    absl::Span<const KVSlice> slices;
+    CmdArgList full_args;
+
+    struct Iterator {
+      CmdArgList args;
+      absl::Span<const KVSlice>::const_iterator it;
+      uint32_t index = 0;
+
+      Iterator(CmdArgList l, absl::Span<const KVSlice>::const_iterator i) : args(l), it(i) {
+      }
+
+      bool operator==(const Iterator& o) const {
+        return it == o.it && index == o.index;
+      }
+
+      bool operator!=(const Iterator& o) const {
+        return it != o.it || index != o.index;
+      }
+
+      std::string_view operator*() const {
+        return facade::ArgS(args, it->first + index);
+      }
+
+      Iterator& operator++() {
+        ++index;
+        if (index + it->first >= it->second) {
+          ++it;
+          index = 0;
+        }
+        return *this;
+      }
+    };
+
+    ShardArgs(CmdArgList fa, absl::Span<const KVSlice> s) : full_args(fa), slices(s) {
+    }
+
+    size_t Size() const;
+
+    Iterator cbegin() const {
+      return Iterator{full_args, slices.cbegin()};
+    }
+
+    Iterator cend() const {
+      return Iterator{full_args, slices.cend()};
+    }
+  };
+
   explicit Transaction(const CommandId* cid);
 
   // Initialize transaction for squashing placed on a specific shard with a given parent tx
@@ -176,7 +227,7 @@ class Transaction {
   OpStatus InitByArgs(DbIndex index, CmdArgList args);
 
   // Get command arguments for specific shard. Called from shard thread.
-  ArgSlice GetShardArgs(ShardId sid) const;
+  ShardArgs GetShardArgs(ShardId sid) const;
 
   // Map arg_index from GetShardArgs slice to index in original command slice from InitByArgs.
   size_t ReverseArgIndex(ShardId shard_id, size_t arg_index) const;
@@ -387,8 +438,8 @@ class Transaction {
     // Set when the shard is prepared for another hop. Sync point. Cleared when execution starts.
     std::atomic_bool is_armed = false;
 
-    uint32_t arg_start = 0;  // Subspan in kv_args_ with local arguments.
-    uint32_t arg_count = 0;
+    uint32_t slice_start = 0;  // Subspan in kv_args_ with local arguments.
+    uint32_t slice_count = 0;
 
     // span into kv_fp_
     uint32_t fp_start = 0;
@@ -398,7 +449,7 @@ class Transaction {
     TxQueue::Iterator pq_pos = TxQueue::kEnd;
 
     // Index of key relative to args in shard that the shard was woken up after blocking wait.
-    uint16_t wake_key_pos = UINT16_MAX;
+    uint32_t wake_key_pos = UINT32_MAX;
 
     // Irrational stats purely for debugging purposes.
     struct Stats {
@@ -441,13 +492,12 @@ class Transaction {
 
   // Auxiliary structure used during initialization
   struct PerShardCache {
-    std::vector<std::string_view> args;
-    std::vector<uint32_t> original_index;
+    std::vector<KVSlice> slices;
     unsigned key_step = 1;
 
     void Clear() {
-      args.clear();
-      original_index.clear();
+      slices.clear();
+      // original_index.clear();
     }
   };
 
@@ -577,7 +627,6 @@ class Transaction {
     });
   }
 
- private:
   // Used for waiting for all hop callbacks to run.
   util::fb2::EmbeddedBlockingCounter run_barrier_{0};
 
@@ -587,10 +636,11 @@ class Transaction {
   // TODO: explore dense packing
   absl::InlinedVector<PerShardData, 4> shard_data_;
 
-  // Stores keys/values of the transaction partitioned by shards.
+  // Stores slices of key/values partitioned by shards.
+  // Slices reference full_args_.
   // We need values as well since we reorder keys, and we need to know what value corresponds
   // to what key.
-  absl::InlinedVector<std::string_view, 4> kv_args_;
+  absl::InlinedVector<KVSlice, 4> args_slices_;
 
   // Fingerprints of keys, precomputed once during the transaction initialization.
   absl::InlinedVector<LockFp, 4> kv_fp_;
@@ -657,5 +707,12 @@ template <typename F> auto Transaction::ScheduleSingleHopT(F&& f) -> decltype(f(
 }
 
 OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args);
+
+inline size_t Transaction::ShardArgs::Size() const {
+  size_t sz = 0;
+  for (const auto& s : slices)
+    sz += (s.second - s.first);
+  return sz;
+}
 
 }  // namespace dfly
