@@ -22,6 +22,7 @@
 #include "server/common.h"
 #include "server/journal/types.h"
 #include "server/table.h"
+#include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
 namespace dfly {
@@ -129,8 +130,9 @@ class Transaction {
   // Runnable that is run on shards during hop executions (often named callback).
   // Callacks should return `OpStatus` which is implicitly converitble to `RunnableResult`!
   using RunnableType = absl::FunctionRef<RunnableResult(Transaction* t, EngineShard*)>;
+
   // Provides keys to block on for specific shard.
-  using WaitKeysProvider = std::function<ArgSlice(Transaction*, EngineShard* shard)>;
+  using WaitKeysProvider = std::function<ShardArgs(Transaction*, EngineShard* shard)>;
 
   // Modes in which a multi transaction can run.
   enum MultiMode {
@@ -164,57 +166,6 @@ class Transaction {
     AWAKED_Q = 1 << 5,         // Whether it was awakened (by NotifySuspended())
     UNLOCK_MULTI = 1 << 6,     // Whether this shard executed UnlockMultiShardCb
     RAN_IMMEDIATELY = 1 << 7,  // Whether the shard executed immediately (during schedule)
-  };
-
-  // References arguments in another array.
-  using KVSlice = std::pair<uint32_t, uint32_t>;  // (begin, end)
-
-  struct ShardArgs {
-    absl::Span<const KVSlice> slices;
-    CmdArgList full_args;
-
-    struct Iterator {
-      CmdArgList args;
-      absl::Span<const KVSlice>::const_iterator it;
-      uint32_t index = 0;
-
-      Iterator(CmdArgList l, absl::Span<const KVSlice>::const_iterator i) : args(l), it(i) {
-      }
-
-      bool operator==(const Iterator& o) const {
-        return it == o.it && index == o.index;
-      }
-
-      bool operator!=(const Iterator& o) const {
-        return it != o.it || index != o.index;
-      }
-
-      std::string_view operator*() const {
-        return facade::ArgS(args, it->first + index);
-      }
-
-      Iterator& operator++() {
-        ++index;
-        if (index + it->first >= it->second) {
-          ++it;
-          index = 0;
-        }
-        return *this;
-      }
-    };
-
-    ShardArgs(CmdArgList fa, absl::Span<const KVSlice> s) : full_args(fa), slices(s) {
-    }
-
-    size_t Size() const;
-
-    Iterator cbegin() const {
-      return Iterator{full_args, slices.cbegin()};
-    }
-
-    Iterator cend() const {
-      return Iterator{full_args, slices.cend()};
-    }
   };
 
   explicit Transaction(const CommandId* cid);
@@ -492,7 +443,7 @@ class Transaction {
 
   // Auxiliary structure used during initialization
   struct PerShardCache {
-    std::vector<KVSlice> slices;
+    std::vector<IndexSlice> slices;
     unsigned key_step = 1;
 
     void Clear() {
@@ -561,12 +512,12 @@ class Transaction {
   void RunCallback(EngineShard* shard);
 
   // Adds itself to watched queue in the shard. Must run in that shard thread.
-  OpStatus WatchInShard(ArgSlice keys, EngineShard* shard, KeyReadyChecker krc);
+  OpStatus WatchInShard(const ShardArgs& keys, EngineShard* shard, KeyReadyChecker krc);
 
   // Expire blocking transaction, unlock keys and unregister it from the blocking controller
   void ExpireBlocking(WaitKeysProvider wcb);
 
-  void ExpireShardCb(ArgSlice wkeys, EngineShard* shard);
+  void ExpireShardCb(const ShardArgs& wkeys, EngineShard* shard);
 
   // Returns true if we need to follow up with PollExecution on this shard.
   bool CancelShardCb(EngineShard* shard);
@@ -640,7 +591,7 @@ class Transaction {
   // Slices reference full_args_.
   // We need values as well since we reorder keys, and we need to know what value corresponds
   // to what key.
-  absl::InlinedVector<KVSlice, 4> args_slices_;
+  absl::InlinedVector<IndexSlice, 4> args_slices_;
 
   // Fingerprints of keys, precomputed once during the transaction initialization.
   absl::InlinedVector<LockFp, 4> kv_fp_;
@@ -707,12 +658,5 @@ template <typename F> auto Transaction::ScheduleSingleHopT(F&& f) -> decltype(f(
 }
 
 OpResult<KeyIndex> DetermineKeys(const CommandId* cid, CmdArgList args);
-
-inline size_t Transaction::ShardArgs::Size() const {
-  size_t sz = 0;
-  for (const auto& s : slices)
-    sz += (s.second - s.first);
-  return sz;
-}
 
 }  // namespace dfly

@@ -246,7 +246,7 @@ void Transaction::InitShardData(absl::Span<const PerShardCache> shard_index, siz
     unique_shard_id_ = i;
 
     for (size_t j = 0; j < src.slices.size(); ++j) {
-      KVSlice slice = src.slices[j];
+      IndexSlice slice = src.slices[j];
       args_slices_.push_back(slice);
       for (uint32_t k = slice.first; k < slice.second; k += src.key_step) {
         string_view key = ArgS(full_args_, k);
@@ -1196,6 +1196,8 @@ size_t Transaction::ReverseArgIndex(ShardId shard_id, size_t arg_index) const {
 
   const auto& sd = shard_data_[shard_id];
   return reverse_index_[sd.arg_start + arg_index];*/
+  LOG(FATAL) << "DELETE";
+  return 0;
 }
 
 OpStatus Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_provider,
@@ -1248,7 +1250,7 @@ OpStatus Transaction::WaitOnWatch(const time_point& tp, WaitKeysProvider wkeys_p
   return result;
 }
 
-OpStatus Transaction::WatchInShard(ArgSlice keys, EngineShard* shard, KeyReadyChecker krc) {
+OpStatus Transaction::WatchInShard(const ShardArgs& keys, EngineShard* shard, KeyReadyChecker krc) {
   auto& sd = shard_data_[SidToId(shard->shard_id())];
 
   CHECK_EQ(0, sd.local_mask & SUSPENDED_Q);
@@ -1256,12 +1258,12 @@ OpStatus Transaction::WatchInShard(ArgSlice keys, EngineShard* shard, KeyReadyCh
   sd.local_mask &= ~OUT_OF_ORDER;
 
   shard->EnsureBlockingController()->AddWatched(keys, std::move(krc), this);
-  DVLOG(2) << "WatchInShard " << DebugId() << ", first_key:" << keys.front();
+  DVLOG(2) << "WatchInShard " << DebugId();
 
   return OpStatus::OK;
 }
 
-void Transaction::ExpireShardCb(ArgSlice wkeys, EngineShard* shard) {
+void Transaction::ExpireShardCb(const ShardArgs& wkeys, EngineShard* shard) {
   // Blocking transactions don't release keys when suspending, release them now.
   auto lock_args = GetLockArgs(shard->shard_id());
   shard->db_slice().Release(LockMode(), lock_args);
@@ -1371,7 +1373,7 @@ bool Transaction::NotifySuspended(TxId committed_txid, ShardId sid, string_view 
   // Change state to awaked and store index of awakened key
   sd.local_mask &= ~SUSPENDED_Q;
   sd.local_mask |= AWAKED_Q;
-  sd.wake_key_pos = it.it->first + it.index;
+  sd.wake_key_pos = it.index();
 
   blocking_barrier_.Close();
   return true;
@@ -1419,10 +1421,15 @@ void Transaction::LogAutoJournalOnShard(EngineShard* shard, RunnableResult resul
   journal::Entry::Payload entry_payload;
 
   string_view cmd{cid_->name()};
+  vector<string_view> view_args;
   if (unique_shard_cnt_ == 1 || args_slices_.empty()) {
     entry_payload = make_pair(cmd, full_args_);
   } else {
-    entry_payload = make_pair(cmd, GetShardArgs(shard->shard_id()));
+    ShardArgs shard_args = GetShardArgs(shard->shard_id());
+    view_args.reserve(shard_args.Size());
+    for (string_view arg : shard_args)
+      view_args.push_back(arg);
+    entry_payload = make_pair(cmd, absl::MakeSpan(view_args));
   }
   LogJournalOnShard(shard, std::move(entry_payload), unique_shard_cnt_, false, true);
 }
