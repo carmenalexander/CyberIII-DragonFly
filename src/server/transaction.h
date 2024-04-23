@@ -22,6 +22,7 @@
 #include "server/common.h"
 #include "server/journal/types.h"
 #include "server/table.h"
+#include "server/tx_base.h"
 #include "util/fibers/synchronization.h"
 
 namespace dfly {
@@ -129,8 +130,9 @@ class Transaction {
   // Runnable that is run on shards during hop executions (often named callback).
   // Callacks should return `OpStatus` which is implicitly converitble to `RunnableResult`!
   using RunnableType = absl::FunctionRef<RunnableResult(Transaction* t, EngineShard*)>;
+
   // Provides keys to block on for specific shard.
-  using WaitKeysProvider = std::function<ArgSlice(Transaction*, EngineShard* shard)>;
+  using WaitKeysProvider = std::function<ShardArgs(Transaction*, EngineShard* shard)>;
 
   // Modes in which a multi transaction can run.
   enum MultiMode {
@@ -176,7 +178,7 @@ class Transaction {
   OpStatus InitByArgs(DbIndex index, CmdArgList args);
 
   // Get command arguments for specific shard. Called from shard thread.
-  ArgSlice GetShardArgs(ShardId sid) const;
+  ShardArgs GetShardArgs(ShardId sid) const;
 
   // Map arg_index from GetShardArgs slice to index in original command slice from InitByArgs.
   size_t ReverseArgIndex(ShardId shard_id, size_t arg_index) const;
@@ -387,8 +389,8 @@ class Transaction {
     // Set when the shard is prepared for another hop. Sync point. Cleared when execution starts.
     std::atomic_bool is_armed = false;
 
-    uint32_t arg_start = 0;  // Subspan in kv_args_ with local arguments.
-    uint32_t arg_count = 0;
+    uint32_t slice_start = 0;  // Subspan in kv_args_ with local arguments.
+    uint32_t slice_count = 0;
 
     // span into kv_fp_
     uint32_t fp_start = 0;
@@ -398,7 +400,7 @@ class Transaction {
     TxQueue::Iterator pq_pos = TxQueue::kEnd;
 
     // Index of key relative to args in shard that the shard was woken up after blocking wait.
-    uint16_t wake_key_pos = UINT16_MAX;
+    uint32_t wake_key_pos = UINT32_MAX;
 
     // Irrational stats purely for debugging purposes.
     struct Stats {
@@ -441,13 +443,12 @@ class Transaction {
 
   // Auxiliary structure used during initialization
   struct PerShardCache {
-    std::vector<std::string_view> args;
-    std::vector<uint32_t> original_index;
+    std::vector<IndexSlice> slices;
     unsigned key_step = 1;
 
     void Clear() {
-      args.clear();
-      original_index.clear();
+      slices.clear();
+      // original_index.clear();
     }
   };
 
@@ -511,12 +512,12 @@ class Transaction {
   void RunCallback(EngineShard* shard);
 
   // Adds itself to watched queue in the shard. Must run in that shard thread.
-  OpStatus WatchInShard(ArgSlice keys, EngineShard* shard, KeyReadyChecker krc);
+  OpStatus WatchInShard(const ShardArgs& keys, EngineShard* shard, KeyReadyChecker krc);
 
   // Expire blocking transaction, unlock keys and unregister it from the blocking controller
   void ExpireBlocking(WaitKeysProvider wcb);
 
-  void ExpireShardCb(ArgSlice wkeys, EngineShard* shard);
+  void ExpireShardCb(const ShardArgs& wkeys, EngineShard* shard);
 
   // Returns true if we need to follow up with PollExecution on this shard.
   bool CancelShardCb(EngineShard* shard);
@@ -577,7 +578,6 @@ class Transaction {
     });
   }
 
- private:
   // Used for waiting for all hop callbacks to run.
   util::fb2::EmbeddedBlockingCounter run_barrier_{0};
 
@@ -587,10 +587,11 @@ class Transaction {
   // TODO: explore dense packing
   absl::InlinedVector<PerShardData, 4> shard_data_;
 
-  // Stores keys/values of the transaction partitioned by shards.
+  // Stores slices of key/values partitioned by shards.
+  // Slices reference full_args_.
   // We need values as well since we reorder keys, and we need to know what value corresponds
   // to what key.
-  absl::InlinedVector<std::string_view, 4> kv_args_;
+  absl::InlinedVector<IndexSlice, 4> args_slices_;
 
   // Fingerprints of keys, precomputed once during the transaction initialization.
   absl::InlinedVector<LockFp, 4> kv_fp_;

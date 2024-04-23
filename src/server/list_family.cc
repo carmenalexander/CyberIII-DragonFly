@@ -416,9 +416,9 @@ OpResult<string> MoveTwoShards(Transaction* trans, string_view src, string_view 
   //
   auto cb = [&](Transaction* t, EngineShard* shard) {
     auto args = t->GetShardArgs(shard->shard_id());
-    DCHECK_EQ(1u, args.size());
-    bool is_dest = args.front() == dest;
-    find_res[is_dest] = Peek(t->GetOpArgs(shard), args.front(), src_dir, !is_dest);
+    DCHECK_EQ(1u, args.Size());
+    bool is_dest = args.Front() == dest;
+    find_res[is_dest] = Peek(t->GetOpArgs(shard), args.Front(), src_dir, !is_dest);
     return OpStatus::OK;
   };
 
@@ -432,7 +432,7 @@ OpResult<string> MoveTwoShards(Transaction* trans, string_view src, string_view 
     // Everything is ok, lets proceed with the mutations.
     auto cb = [&](Transaction* t, EngineShard* shard) {
       auto args = t->GetShardArgs(shard->shard_id());
-      auto key = args.front();
+      auto key = args.Front();
       bool is_dest = (key == dest);
       OpArgs op_args = t->GetOpArgs(shard);
 
@@ -448,7 +448,15 @@ OpResult<string> MoveTwoShards(Transaction* trans, string_view src, string_view 
           // hack, again. since we hacked which queue we are waiting on (see RunPair)
           // we must clean-up src key here manually. See RunPair why we do this.
           // in short- we suspended on "src" on both shards.
-          shard->blocking_controller()->FinalizeWatched(ArgSlice{&src, 1}, t);
+          //
+          // A very awakward translation from a single key to ShardArgs.
+          // We create a mutable slice (which will never be mutated) from the key, then we create
+          // a CmdArgList of size 1 that references mslice and finally
+          // we reference the first element in the CmdArgList via islice.
+          MutableSlice mslice(const_cast<char*>(src.data()), src.size());
+          IndexSlice islice(0, 1);
+          ShardArgs shard_args{CmdArgList{&mslice, 1}, absl::MakeSpan(&islice, 1)};
+          shard->blocking_controller()->FinalizeWatched(shard_args, t);
         }
       } else {
         DVLOG(1) << "Popping value from list: " << key;
@@ -873,7 +881,15 @@ OpResult<string> BPopPusher::RunSingle(ConnectionContext* cntx, time_point tp) {
     return op_res;
   }
 
-  auto wcb = [&](Transaction* t, EngineShard* shard) { return ArgSlice{&this->pop_key_, 1}; };
+  // Very awakward translation from a single key to ShardArgs.
+  // We create a mutable slice (which will never be mutated) from the key, then we create
+  // a CmdArgList of size 1 that references mslice and finally we reference the first element in
+  // the CmdArgList via islice.
+  MutableSlice mslice(const_cast<char*>(this->pop_key_.data()), this->pop_key_.size());
+  IndexSlice islice(0, 1);
+  auto wcb = [&](Transaction* t, EngineShard* shard) {
+    return ShardArgs(facade::CmdArgList{&mslice, 1}, absl::MakeSpan(&islice, 1));
+  };
 
   const auto key_checker = [](EngineShard* owner, const DbContext& context, Transaction*,
                               std::string_view key) -> bool {
