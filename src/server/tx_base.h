@@ -108,10 +108,11 @@ using KeyReadyChecker =
 // References arguments in another array.
 using IndexSlice = std::pair<uint32_t, uint32_t>;  // (begin, end)
 
-struct ShardArgs {
-  facade::CmdArgList full_args;
-  absl::Span<const IndexSlice> slices;
+class ShardArgs {
+  facade::CmdArgList full_args_;
+  absl::Span<const IndexSlice> slices_;
 
+ public:
   struct Iterator {
     using iterator_category = std::input_iterator_tag;
     using value_type = std::string_view;
@@ -153,17 +154,17 @@ struct ShardArgs {
     }
   };
 
-  ShardArgs(facade::CmdArgList fa, absl::Span<const IndexSlice> s) : full_args(fa), slices(s) {
+  ShardArgs(facade::CmdArgList fa, absl::Span<const IndexSlice> s) : full_args_(fa), slices_(s) {
   }
 
   size_t Size() const;
 
   Iterator cbegin() const {
-    return Iterator{full_args, slices.cbegin()};
+    return Iterator{full_args_, slices_.cbegin()};
   }
 
   Iterator cend() const {
-    return Iterator{full_args, slices.cend()};
+    return Iterator{full_args_, slices_.cend()};
   }
 
   Iterator begin() const {
@@ -172,6 +173,14 @@ struct ShardArgs {
 
   Iterator end() const {
     return cend();
+  }
+
+  bool Empty() const {
+    return slices_.empty();
+  }
+
+  std::string_view Front() const {
+    return *cbegin();
   }
 };
 

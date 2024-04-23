@@ -822,39 +822,43 @@ double GetKeyWeight(Transaction* t, ShardId shard_id, const vector<double>& weig
 
 OpResult<ScoredMap> OpUnion(EngineShard* shard, Transaction* t, string_view dest, AggType agg_type,
                             const vector<double>& weights, bool store) {
-  ArgSlice keys = t->GetShardArgs(shard->shard_id());
-  DVLOG(1) << "shard:" << shard->shard_id() << ", keys " << keys;
-  DCHECK(!keys.empty());
+  ShardArgs keys = t->GetShardArgs(shard->shard_id());
+  DCHECK(!keys.Empty());
 
   unsigned cmdargs_keys_offset = 1;  // after {numkeys} for ZUNION
   unsigned removed_keys = 0;
 
+  ShardArgs::Iterator beg = keys.begin(), end = keys.end();
+
   if (store) {
     // first global index is 2 after {destkey, numkeys}.
     ++cmdargs_keys_offset;
-    if (keys.front() == dest) {
-      keys.remove_prefix(1);
+    if (*beg == dest) {
+      ++beg;
       ++removed_keys;
     }
 
     // In case ONLY the destination key is hosted in this shard no work on this shard should be
     // done in this step
-    if (keys.empty()) {
+    if (beg == end) {
       return OpStatus::OK;
     }
   }
 
   auto& db_slice = shard->db_slice();
-  KeyIterWeightVec key_weight_vec(keys.size());
-  for (unsigned j = 0; j < keys.size(); ++j) {
-    auto it_res = db_slice.FindReadOnly(t->GetDbContext(), keys[j], OBJ_ZSET);
+  KeyIterWeightVec key_weight_vec(keys.Size() - removed_keys);
+  unsigned index = 0;
+  for (; beg != end; ++beg) {
+    auto it_res = db_slice.FindReadOnly(t->GetDbContext(), *beg, OBJ_ZSET);
     if (it_res == OpStatus::WRONG_TYPE)  // TODO: support sets with default score 1.
       return it_res.status();
-    if (!it_res)
+    if (!it_res) {
+      ++index;
       continue;
-
-    key_weight_vec[j] = {*it_res, GetKeyWeight(t, shard->shard_id(), weights, j + removed_keys,
-                                               cmdargs_keys_offset)};
+    }
+    key_weight_vec[index] = {*it_res, GetKeyWeight(t, shard->shard_id(), weights,
+                                                   index + removed_keys, cmdargs_keys_offset)};
+    ++index;
   }
 
   return UnionShardKeysWithScore(key_weight_vec, agg_type);
@@ -871,46 +875,47 @@ ScoredMap ZSetFromSet(const PrimeValue& pv, double weight) {
 
 OpResult<ScoredMap> OpInter(EngineShard* shard, Transaction* t, string_view dest, AggType agg_type,
                             const vector<double>& weights, bool store) {
-  ArgSlice keys = t->GetShardArgs(shard->shard_id());
-  DVLOG(1) << "shard:" << shard->shard_id() << ", keys " << keys;
-  DCHECK(!keys.empty());
+  ShardArgs keys = t->GetShardArgs(shard->shard_id());
+  DCHECK(!keys.Empty());
 
   unsigned removed_keys = 0;
   unsigned cmdargs_keys_offset = 1;
+  ShardArgs::Iterator beg = keys.begin(), end = keys.end();
 
   if (store) {
     // first global index is 2 after {destkey, numkeys}.
     ++cmdargs_keys_offset;
 
-    if (keys.front() == dest) {
-      keys.remove_prefix(1);
+    if (*beg == dest) {
+      ++beg;
       ++removed_keys;
     }
 
     // In case ONLY the destination key is hosted in this shard no work on this shard should be
     // done in this step
-    if (keys.empty()) {
+    if (beg == end) {
       return OpStatus::SKIPPED;
     }
   }
 
   auto& db_slice = shard->db_slice();
-  vector<pair<DbSlice::ItAndUpdater, double>> it_arr(keys.size());
-  if (it_arr.empty())          // could be when only the dest key is hosted in this shard
-    return OpStatus::SKIPPED;  // return noop
+  vector<pair<DbSlice::ItAndUpdater, double>> it_arr(keys.Size() - removed_keys);
 
-  for (unsigned j = 0; j < keys.size(); ++j) {
-    auto it_res = db_slice.FindMutable(t->GetDbContext(), keys[j]);
-    if (!IsValid(it_res.it))
+  unsigned index = 0;
+  for (; beg != end; ++beg) {
+    auto it_res = db_slice.FindMutable(t->GetDbContext(), *beg);
+    if (!IsValid(it_res.it)) {
+      ++index;
       continue;  // we exit in the next loop
+    }
 
     // sets are supported for ZINTER* commands:
     auto obj_type = it_res.it->second.ObjType();
     if (obj_type != OBJ_ZSET && obj_type != OBJ_SET)
       return OpStatus::WRONG_TYPE;
 
-    it_arr[j] = {std::move(it_res), GetKeyWeight(t, shard->shard_id(), weights, j + removed_keys,
-                                                 cmdargs_keys_offset)};
+    it_arr[index] = {std::move(it_res), GetKeyWeight(t, shard->shard_id(), weights,
+                                                     index + removed_keys, cmdargs_keys_offset)};
   }
 
   ScoredMap result;
@@ -1343,16 +1348,15 @@ void BZPopMinMax(CmdArgList args, ConnectionContext* cntx, bool is_max) {
 }
 
 vector<ScoredMap> OpFetch(EngineShard* shard, Transaction* t) {
-  ArgSlice keys = t->GetShardArgs(shard->shard_id());
-  DVLOG(1) << "shard:" << shard->shard_id() << ", keys " << keys;
-  DCHECK(!keys.empty());
+  ShardArgs keys = t->GetShardArgs(shard->shard_id());
+  DCHECK(!keys.Empty());
 
   vector<ScoredMap> results;
-  results.reserve(keys.size());
+  results.reserve(keys.Size());
 
   auto& db_slice = shard->db_slice();
-  for (size_t i = 0; i < keys.size(); ++i) {
-    auto it = db_slice.FindReadOnly(t->GetDbContext(), keys[i], OBJ_ZSET);
+  for (string_view key : keys) {
+    auto it = db_slice.FindReadOnly(t->GetDbContext(), key, OBJ_ZSET);
     if (!it) {
       results.push_back({});
       continue;
