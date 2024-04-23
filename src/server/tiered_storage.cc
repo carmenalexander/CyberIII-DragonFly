@@ -830,14 +830,15 @@ class TieredStorageV2::ShardOpManager : public tiering::OpManager {
     }
   }
 
-  void ReportFetched(EntryId id, std::string_view value, tiering::DiskSegment segment) override {
+  void ReportFetched(EntryId id, std::string_view value, tiering::DiskSegment segment,
+                     bool modified) override {
     DCHECK(holds_alternative<string_view>(id));  // we never issue reads for bins
 
-    if (!cache_fetched_)
+    // Modified values are always cached and deleted
+    if (!modified && !cache_fetched_)
       return;
 
-    if (!SetInMemory(get<string_view>(id), value, segment))
-      return;
+    SetInMemory(get<string_view>(id), value, segment);
 
     // Delete value
     if (segment.length >= TieredStorageV2::kMinOccupancySize) {
@@ -925,6 +926,12 @@ void TieredStorageV2::Delete(string_view key, PrimeValue* value) {
     }
     value->SetIoPending(false);
   }
+}
+
+void TieredStorageV2::Modify(std::string_view key, const PrimeValue& pv,
+                             std::function<void(std::string*)> modf) {
+  DCHECK(pv.IsExternal());
+  op_manager_->Modify(key, pv.GetExternalSlice(), std::move(modf));
 }
 
 bool TieredStorageV2::ShouldStash(const PrimeValue& pv) {
