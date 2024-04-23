@@ -82,7 +82,7 @@ template <bool IsConst> class JsonconsDfsItem {
   unsigned segment_step_ = 1;
 
   DepthState depth_state_;
-  std::variant<std::monostate, ObjIterator, ArrayIterator> state_;
+  std::variant<std::monostate, ObjIterator, std::pair<ArrayIterator, ArrayIterator>> state_;
 };
 
 // Traverses a json object according to the given path and calls the callback for each matching
@@ -139,12 +139,12 @@ auto JsonconsDfsItem<IsConst>::Advance(const PathSegment& segment) -> AdvanceRes
             ++it;
             return it == obj().object_range().end() ? Exhausted() : Next(it->value());
           },
-          [&](ArrayIterator& it) -> AdvanceResult {
+          [&](std::pair<ArrayIterator, ArrayIterator>& pair) -> AdvanceResult {
             if (!ShouldIterateAll(segment.type()))
               return Exhausted();
 
-            ++it;
-            return it == obj().array_range().end() ? Exhausted() : Next(*it);
+            ++pair.first;
+            return pair.first == pair.second ? Exhausted() : Next(*pair.first);
           },
       },
       state_);
@@ -167,55 +167,43 @@ auto JsonconsDfsItem<IsConst>::Init(const PathSegment& segment) -> AdvanceResult
       break;
     }
     case SegmentType::INDEX: {
-      unsigned index = segment.index();
-      if (obj().is_array()) {
-        if (index >= obj().size()) {
-          return nonstd::make_unexpected(OUT_OF_BOUNDS);
-        }
-        auto it = ArrBegin() + index;
-        state_ = it;
-        return Next(*it);
+      IndexExpr index = NormalizeIndexExpr(segment.index(), node->size());
+      if (index.first >= index.second) {
+        return make_unexpected(OUT_OF_BOUNDS);
       }
-      break;
+
+      auto start = ArrBegin() + index.first, end = ArrBegin() + index.second;
+      state_.emplace(make_pair(start, end));
+      return Next(*start);
+    } break;
+  }
+
+  case SegmentType::DESCENT:
+    if (segment_step_ == 1) {
+      // first time, branching to return the same object but with the next segment,
+      // exploring the path of ignoring the DESCENT operator.
+      // Also, shift the state (segment_step) to bypass this branch next time.
+      segment_step_ = 0;
+      return DepthState{depth_state_.first, depth_state_.second + 1};
     }
 
-    case SegmentType::DESCENT:
-      if (segment_step_ == 1) {
-        // first time, branching to return the same object but with the next segment,
-        // exploring the path of ignoring the DESCENT operator.
-        // Also, shift the state (segment_step) to bypass this branch next time.
-        segment_step_ = 0;
-        return DepthState{depth_state_.first, depth_state_.second + 1};
-      }
-
-      // Now traverse all the children but do not progress with segment path.
-      // This is why segment_step_ is set to 0.
-      [[fallthrough]];
-    case SegmentType::WILDCARD: {
-      if (obj().is_object()) {
-        jsoncons::range rng = obj().object_range();
-        if (rng.cbegin() == rng.cend()) {
-          return Exhausted();
-        }
-        state_ = Begin();
-        return Next(Begin()->value());
-      }
-
-      if (obj().is_array()) {
-        jsoncons::range rng = obj().array_range();
-        if (rng.cbegin() == rng.cend()) {
-          return Exhausted();
-        }
-        state_ = ArrBegin();
-        return Next(*ArrBegin());
-      }
-      break;
+    // Now traverse all the children but do not progress with segment path.
+    // This is why segment_step_ is set to 0.
+    [[fallthrough]];
+  case SegmentType::WILDCARD: {
+    jsoncons::range rng = obj().object_range();
+    if (rng.cbegin() == rng.cend()) {
+      return Exhausted();
     }
-    default:
-      LOG(DFATAL) << "Unknown segment " << SegmentName(segment.type());
-  }  // end switch
+    state_ = Begin();
+    return Next(Begin()->value());
+    break;
+  }
+  default:
+    LOG(DFATAL) << "Unknown segment " << SegmentName(segment.type());
+}  // end switch
 
-  return nonstd::make_unexpected(MISMATCH);
+return nonstd::make_unexpected(MISMATCH);
 }
 
 }  // namespace dfly::json::detail

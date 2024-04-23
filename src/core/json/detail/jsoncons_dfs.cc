@@ -120,22 +120,20 @@ auto Dfs::PerformStep(const PathSegment& segment, const JsonType& node, const Cb
     case SegmentType::INDEX: {
       if (!node.is_array())
         return make_unexpected(MISMATCH);
-      if (segment.index() >= node.size()) {
+      IndexExpr index = NormalizeIndexExpr(segment.index(), node.size());
+      if (index.first >= index.second) {
         return make_unexpected(OUT_OF_BOUNDS);
       }
-      DoCall(callback, nullopt, node[segment.index()]);
+      for (; index.first < index.second; ++index.first) {
+        DoCall(callback, nullopt, node[index.first]);
+      }
     } break;
 
     case SegmentType::DESCENT:
     case SegmentType::WILDCARD: {
-      if (node.is_object()) {
-        for (const auto& k_v : node.object_range()) {
-          DoCall(callback, k_v.key(), k_v.value());
-        }
-      } else if (node.is_array()) {
-        for (const auto& val : node.array_range()) {
-          DoCall(callback, nullopt, val);
-        }
+      DCHECK(node.is_object());
+      for (const auto& k_v : node.object_range()) {
+        DoCall(callback, k_v.key(), k_v.value());
       }
     } break;
     default:
@@ -161,12 +159,19 @@ auto Dfs::MutateStep(const PathSegment& segment, const MutateCallback& cb, JsonT
     case SegmentType::INDEX: {
       if (!node->is_array())
         return make_unexpected(MISMATCH);
-      if (segment.index() >= node->size()) {
+      IndexExpr index = NormalizeIndexExpr(segment.index(), node->size());
+      if (index.first >= index.second) {
         return make_unexpected(OUT_OF_BOUNDS);
       }
-      auto it = node->array_range().begin() + segment.index();
-      if (Mutate(cb, nullopt, &*it)) {
-        node->erase(it);
+
+      while (index.first < index.second) {
+        auto it = node->array_range().begin() + index.first;
+        if (Mutate(cb, nullopt, &*it)) {
+          node->erase(it);
+          --index.second;
+        } else {
+          ++index.first;
+        }
       }
     } break;
 

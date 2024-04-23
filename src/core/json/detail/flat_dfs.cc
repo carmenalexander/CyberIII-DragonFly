@@ -43,21 +43,20 @@ auto FlatDfsItem::Init(const PathSegment& segment) -> AdvanceResult {
         if (index == UINT_MAX) {
           return Exhausted();
         }
-        state_ = index;
+        state_.emplace(index, index + 1);
         return DepthState{obj().AsVector()[index], depth_state_.second + 1};
       }
       break;
     }
     case SegmentType::INDEX: {
-      unsigned index = segment.index();
-      if (obj().IsUntypedVector()) {
-        auto vec = obj().AsVector();
-        if (index >= vec.size()) {
-          return nonstd::make_unexpected(OUT_OF_BOUNDS);
-        }
-        state_ = index;
-        return Next(vec[index]);
+      auto vec = obj().AsVector();
+      IndexExpr index = NormalizeIndexExpr(segment.index(), vec.size());
+      if (index.first >= index.second) {
+        return make_unexpected(OUT_OF_BOUNDS);
       }
+
+      state_ = index;
+      return Next(vec[index.first]);
       break;
     }
 
@@ -78,7 +77,7 @@ auto FlatDfsItem::Init(const PathSegment& segment) -> AdvanceResult {
       if (vec.size() == 0) {
         return Exhausted();
       }
-      state_ = 0;
+      state_.emplace(IndexExpr(0, vec.size()));
       return Next(vec[0]);
     } break;
 
@@ -90,18 +89,19 @@ auto FlatDfsItem::Init(const PathSegment& segment) -> AdvanceResult {
 }
 
 auto FlatDfsItem::Advance(const PathSegment& segment) -> AdvanceResult {
-  if (state_ == kInit) {
+  if (!state_) {
     return Init(segment);
   }
 
   if (!ShouldIterateAll(segment.type()))
     return Exhausted();
 
-  ++state_;
-  auto vec = obj().AsVector();
-  if (state_ >= vec.size())
+  ++state_->first;
+  if (state_->first >= state_->second)
     return Exhausted();
-  return Next(vec[state_]);
+  auto vec = obj().AsVector();
+
+  return Next(vec[state_->first]);
 }
 
 FlatDfs FlatDfs::Traverse(absl::Span<const PathSegment> path, const flexbuffers::Reference root,

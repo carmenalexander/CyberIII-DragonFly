@@ -207,6 +207,7 @@ TYPED_TEST(JsonPathTest, Parser) {
   EXPECT_EQ(1, path[2].index());
 
   EXPECT_EQ(0, this->Parse("$.plays[*].game"));
+  EXPECT_EQ(0, this->Parse("$.*.bar[1:2]"));
 }
 
 TYPED_TEST(JsonPathTest, Root) {
